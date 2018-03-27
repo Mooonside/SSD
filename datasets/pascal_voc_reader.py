@@ -6,6 +6,7 @@ import os.path
 
 import tensorflow as tf
 from tensorflow.python.ops import image_ops
+from functools import partial as set_parameter
 
 # Basic model parameters as external flags.
 FLAGS = None
@@ -26,10 +27,10 @@ def decode(serialized_example):
             'image/shape': tf.FixedLenFeature([3], tf.int64),
             'image/format': tf.FixedLenFeature([], tf.string),
             'image/encoded': tf.FixedLenFeature([], tf.string),
-            'image/object/bbox/xmin': tf.VarLenFeature(tf.int64),
-            'image/object/bbox/ymin': tf.VarLenFeature(tf.int64),
-            'image/object/bbox/xmax': tf.VarLenFeature(tf.int64),
-            'image/object/bbox/ymax': tf.VarLenFeature(tf.int64),
+            'image/object/bbox/xmin': tf.VarLenFeature(tf.float32),
+            'image/object/bbox/ymin': tf.VarLenFeature(tf.float32),
+            'image/object/bbox/xmax': tf.VarLenFeature(tf.float32),
+            'image/object/bbox/ymax': tf.VarLenFeature(tf.float32),
             'image/object/bbox/label': tf.VarLenFeature(tf.int64),
             'image/object/bbox/difficult': tf.VarLenFeature(tf.int64),
             'image/object/bbox/truncated': tf.VarLenFeature(tf.int64)
@@ -49,7 +50,7 @@ def extract(features):
     ymaxs = tf.sparse_tensor_to_dense(features['image/object/bbox/ymax'])
     labels = tf.sparse_tensor_to_dense(features['image/object/bbox/label'])
     # read data in the format xmins, ymins, xmaxs, ymaxes !
-    bboxes = tf.stack([ymins, xmins, ymaxs, xmaxs])
+    bboxes = tf.transpose(tf.stack([ymins, xmins, ymaxs, xmaxs]))
 
     return name, image, labels, bboxes
 
@@ -72,7 +73,15 @@ def cast_type(name, image, labels, bboxes):
     return name, tf.cast(image, tf.float32), tf.cast(labels, tf.int32), bboxes
 
 
-def get_dataset(dir, batch_size, num_epochs, padding='SAME'):
+def reshape(name, image, label, bboxes, reshape_size=None):
+    if reshape_size is not None:
+        image = tf.expand_dims(image, axis=0)
+        image = tf.image.resize_bilinear(image, reshape_size)
+
+    return name, tf.squeeze(image, axis=0), label, bboxes
+
+
+def get_dataset(dir, batch_size, num_epochs, reshape_size=[300, 300], padding='SAME'):
     if not num_epochs:
         num_epochs = None
     filenames = [os.path.join(dir, i) for i in os.listdir(dir)]
@@ -89,6 +98,7 @@ def get_dataset(dir, batch_size, num_epochs, padding='SAME'):
         dataset = dataset.map(cast_type)
         dataset = dataset.map(augment)
         dataset = dataset.map(normalize)
+        dataset = dataset.map(set_parameter(reshape, reshape_size=reshape_size))
 
         # the parameter is the queue size
         dataset = dataset.shuffle(1000 + 3 * batch_size)
@@ -101,12 +111,14 @@ def get_next_batch(dataset):
     return iterator.get_next()
 
 
-# if __name__ == '__main__':
-#     dataset = get_dataset(dir=TRAIN_DIR, batch_size=1, num_epochs=1)
-#     name, image, labels, bboxes = get_next_batch(dataset)
-#
-#     sess = tf.Session()
-#     sess.run(tf.global_variables_initializer())
-#     name_v, image_v, labels_v, bboxes_v = sess.run([name, image, labels, bboxes])
-#     print(name_v)
-#     print(bboxes_v)
+if __name__ == '__main__':
+    dataset = get_dataset(dir=TRAIN_DIR, batch_size=1, num_epochs=1)
+    name, image, labels, bboxes = get_next_batch(dataset)
+
+    sess = tf.Session()
+    # sess.run(tf.global_variables_initializer())
+    name_v, image_v, labels_v, bboxes_v = sess.run([name, image, labels, bboxes])
+    print(name_v)
+    print(image_v.shape)
+    print(labels_v.shape)
+    print(bboxes_v.shape)

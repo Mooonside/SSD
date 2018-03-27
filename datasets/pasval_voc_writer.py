@@ -89,11 +89,12 @@ class PascalVocWriter:
                            int(bbox.find('ymax').text)
                            ))
 
-        bboxes = np.asarray(bboxes, dtype=np.int64)
-        xmins = bboxes[:, 0].tolist()
-        ymins = bboxes[:, 1].tolist()
-        xmaxs = bboxes[:, 2].tolist()
-        ymaxs = bboxes[:, 3].tolist()
+        # turn to relative mode
+        bboxes = np.asarray(bboxes, dtype=np.float32)
+        xmins = (bboxes[:, 0] / shape[1]).tolist()
+        ymins = (bboxes[:, 1] / shape[0]).tolist()
+        xmaxs = (bboxes[:, 2] / shape[1]).tolist()
+        ymaxs = (bboxes[:, 3] / shape[0]).tolist()
 
         example = tf.train.Example(
             features=tf.train.Features(
@@ -102,10 +103,10 @@ class PascalVocWriter:
                     'image/shape': int64_feature(shape),
                     'image/format': bytes_feature(image_format),
                     'image/encoded': bytes_feature(img_data),
-                    'image/object/bbox/xmin': int64_feature(xmins),
-                    'image/object/bbox/ymin': int64_feature(ymins),
-                    'image/object/bbox/xmax': int64_feature(xmaxs),
-                    'image/object/bbox/ymax': int64_feature(ymaxs),
+                    'image/object/bbox/xmin': float_feature(xmins),
+                    'image/object/bbox/ymin': float_feature(ymins),
+                    'image/object/bbox/xmax': float_feature(xmaxs),
+                    'image/object/bbox/ymax': float_feature(ymaxs),
                     'image/object/bbox/label': int64_feature(labels),
                     'image/object/bbox/difficult': int64_feature(difficult),
                     'image/object/bbox/truncated': int64_feature(truncated),
@@ -153,5 +154,5 @@ def convert_train():
 
 
 if __name__ == '__main__':
-    # convert_val()
-    convert_train()
+    convert_val()
+    # convert_train()

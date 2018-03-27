@@ -4,7 +4,9 @@ import numpy as np
 import tensorflow as tf
 
 from backbones.vgg_16 import vgg_conv_block
-from tf_ops.wrap_ops import max_pool2d, conv2d, batch_norm2d, tensor_shape
+from tf_ops.wrap_ops import max_pool2d, conv2d, batch_norm2d, \
+    tensor_shape, softmax_with_logits, smooth_l1, LOSS_COLLECTIONS
+from datasets.pascal_voc_reader import get_dataset, get_next_batch, TRAIN_DIR
 
 arg_scope = tf.contrib.framework.arg_scope
 
@@ -27,12 +29,12 @@ default_params = SSDParams(
     no_annotation_label=21,
     feat_layers=['block_4', 'block_7', 'block_8', 'block_9', 'block_10', 'block_11'],
     anchor_scales=np.linspace(0.20, 0.90, 6 + 1),
-    anchor_ratios=[[2, .5],
-                   [2, .5, 3, 1. / 3],
-                   [2, .5, 3, 1. / 3],
-                   [2, .5, 3, 1. / 3],
-                   [2, .5],
-                   [2, .5]],
+    anchor_ratios=[[2, 1, .5],
+                   [2, 1, .5, 3, 1. / 3],
+                   [2, 1, .5, 3, 1. / 3],
+                   [2, 1, .5, 3, 1. / 3],
+                   [2, 1, .5],
+                   [2, 1, .5]],
     normalizations=[20, -1, -1, -1, -1, -1],
     prior_scaling=[0.1, 0.1, 0.2, 0.2]
 )
@@ -48,7 +50,7 @@ def ssd_arg_scope(weight_init=None, weight_reg=None,
             return arg_sc
 
 
-def ssd_vgg16(inputs, scope='ssd_vgg16'):
+def ssd_vgg16(inputs, scope=None):
     with tf.variable_scope(scope, 'ssd_vgg16', [inputs], reuse=tf.AUTO_REUSE) as sc:
         end_points_collection = sc.original_name_scope + '_end_points'
 
@@ -105,7 +107,9 @@ def ssd_vgg16(inputs, scope='ssd_vgg16'):
 
             [end_points.update({i.name: i}) for i in tf.get_collection(end_points_collection)]
 
-            return net, end_points
+            prediction_gathers = layers_predictions(end_points)
+
+            return net, end_points, prediction_gathers
 
 
 def _layer_prediction(feature_map, num_anchors, num_classes, name=None):
@@ -156,7 +160,8 @@ def _layer_anchors(feature_shape, scale_c, scale_n, ratios):
     # return one extra scale for aspect ratio = 1, as described in Original Paper
     h.append(np.sqrt(scale_c * scale_n))
     w.append(np.sqrt(scale_c * scale_n))
-    return y, x, h, w
+
+    return y, x, np.asarray(h, np.float32), np.asarray(w, np.float32)
 
 
 def _layer_encoding(layer_anchors, labels, bboxes, ignore_label=default_params.num_classes + 1):
@@ -173,7 +178,7 @@ def _layer_encoding(layer_anchors, labels, bboxes, ignore_label=default_params.n
     assert anchors_cy.shape == anchors_cy.shape and anchors_h.shape == anchors_w.shape
 
     # [fh, fW, num_anchors]
-    anchors_shape = anchors_cy.shape + anchors_h.shape
+    anchors_shape = anchors_ymin.shape
 
     # for each anchor, assign a label for it
     # Steps:
@@ -185,9 +190,14 @@ def _layer_encoding(layer_anchors, labels, bboxes, ignore_label=default_params.n
     encode_xmin = tf.zeros(anchors_shape, dtype=tf.float32)
     encode_ymax = tf.ones(anchors_shape, dtype=tf.float32)
     encode_xmax = tf.ones(anchors_shape, dtype=tf.float32)
+    # remove the None(batch size) = 1
+    bboxes = tf.squeeze(bboxes, axis=0)
 
-    for idx, bbox in enumerate(bboxes):
-        bbox_ymin, bbox_xmin, bbox_ymax, bbox_xmax = bbox
+    def condition(idx, bboxes, encode_labels, encode_ious, encode_ymin, encode_xmin, encode_ymax, encode_xmax):
+        return tf.less(idx, tf.shape(bboxes)[0])
+
+    def body(idx, bboxes, encode_labels, encode_ious, encode_ymin, encode_xmin, encode_ymax, encode_xmax):
+        bbox_ymin, bbox_xmin, bbox_ymax, bbox_xmax = tf.unstack(bboxes[idx,:])
         bbox_volume = (bbox_ymax - bbox_ymin) * (bbox_xmax - bbox_xmin)
 
         inter_ymin = tf.maximum(bbox_ymin, anchors_ymin)
@@ -208,7 +218,19 @@ def _layer_encoding(layer_anchors, labels, bboxes, ignore_label=default_params.n
         encode_ymax += selector * bbox_ymax + (1 - selector) * encode_ymax
         encode_xmax += selector * bbox_xmax + (1 - selector) * encode_xmax
 
-        encode_ious = max(encode_ious, ious)
+        encode_ious = tf.maximum(encode_ious, ious)
+        return [idx + 1, bboxes, encode_labels, encode_ious, encode_ymin, encode_xmin, encode_ymax, encode_xmax]
+
+    idx = 0
+    [idx, bboxes, encode_labels, encode_ious, encode_ymin, encode_xmin, encode_ymax, encode_xmax] = \
+        tf.while_loop(cond=condition, body=body, loop_vars=[idx, bboxes,
+                                                            encode_labels,
+                                                            encode_ious,
+                                                            encode_ymin,
+                                                            encode_xmin,
+                                                            encode_ymax,
+                                                            encode_xmax])
+
     # reform to center, size pattern
     encode_cy = (encode_ymin + encode_ymax) / 2
     encode_cx = (encode_xmin + encode_xmax) / 2
@@ -221,8 +243,56 @@ def _layer_encoding(layer_anchors, labels, bboxes, ignore_label=default_params.n
     encode_h = tf.log(encode_h / anchors_h)
     encode_w = tf.log(encode_w / anchors_w)
 
-    encode_truth = tf.concat([encode_cy, encode_cx, encode_h, encode_w], axis=-1)
-    return encode_truth, encode_labels, encode_ious
+    encode_locations = tf.stack([encode_cy, encode_cx, encode_h, encode_w], axis=-1)
+    return encode_locations, encode_labels, encode_ious
+
+
+def _layer_loss(locations, scores, encode_locations, encode_labels, encode_ious, pos_th, neg_ratio):
+    """
+    Calculate loss for one layer
+    :param locations: predicted locations [1, H, W, K, 4 ]
+    :param scores: predicted scores [1, H, W, K, 21]
+    :param encode_locations: [H, W, K, 4]
+    :param encode_labels: [H, W, K]
+    :param encode_ious: [H, W, K]
+    :return:
+    """
+    positive_mask = encode_ious > pos_th
+    positive_num = tf.reduce_sum(tf.cast(positive_mask, tf.int32))
+    # if no positive , ensure still some negatives, e.g. at least four bboxes along H side
+    negative_num = tf.maximum(neg_ratio * positive_num, tf.shape(encode_locations)[0] * 4)
+    # Hard Negative Mining
+    neg_values, _ = tf.nn.top_k(-tf.reshape(scores,[-1]), k=negative_num)
+    # incase that -neg_value[-1] is larger than pos_th
+    negative_mask = tf.logical_and(
+        encode_ious < -neg_values[-1],
+        tf.logical_not(positive_mask)
+    )
+
+    with tf.name_scope('cross_entropy_loss'):
+        with tf.name_scope('positive'):
+            pos_loss = softmax_with_logits(predictions=scores,
+                                           labels=encode_labels,
+                                           ignore_labels=[],
+                                           weights=tf.cast(tf.reshape(positive_mask, [-1]), tf.float32),
+                                           loss_collections=[LOSS_COLLECTIONS])
+        with tf.name_scope('negative'):
+            neg_loss = softmax_with_logits(predictions=scores,
+                                           labels=encode_labels,
+                                           ignore_labels=[],
+                                           weights=tf.cast(tf.reshape(negative_mask, [-1]), tf.float32),
+                                           loss_collections=[LOSS_COLLECTIONS])
+
+    with tf.name_scope('bbox_regression_loss'):
+        reg_loss = smooth_l1(locations - encode_locations)
+        # [H*W*K]
+        reg_loss = tf.reduce_mean(
+            tf.reshape(tf.reduce_sum(reg_loss, axis=-1), [-1]) * tf.cast(positive_mask, tf.float32),
+            name='regression_loss'
+        )
+        tf.add_to_collection(LOSS_COLLECTIONS, reg_loss)
+
+    return pos_loss, neg_loss, reg_loss
 
 
 def layers_predictions(end_points):
@@ -235,8 +305,9 @@ def layers_predictions(end_points):
     for idx, key in enumerate(default_params.feat_layers):
         layer = end_points[key]
         num_ratios = len(default_params.anchor_ratios[idx])
-        locations, scores = _layer_prediction(layer, num_anchors=2 + num_ratios,
-                                              num_classes=default_params.num_classes)
+        locations, scores = _layer_prediction(layer, num_anchors=1 + num_ratios,
+                                              num_classes=default_params.num_classes,
+                                              name='feature2bbox{}'.format(idx+1))
         gather_locations.append(locations)
         gather_scores.append(scores)
     return gather_locations, gather_scores
@@ -263,23 +334,52 @@ def layers_anchors(end_points):
 
 
 def layers_encoding(all_anchors, labels, bboxes):
-    gather_truth, gather_labels, gather_ious = [], [], []
-    for anchor in all_anchors:
-        encode_truth, encode_labels, encode_ious = \
+    gather_locations, gather_labels, gather_ious = [], [], []
+    ys, xs, hs, ws = all_anchors
+    for idx in range(len(ys)):
+        anchor = ys[idx], xs[idx], hs[idx], ws[idx]
+        encode_locations, encode_labels, encode_ious = \
             _layer_encoding(anchor, labels, bboxes)
-        gather_truth.append(encode_truth)
+        gather_locations.append(encode_locations)
         gather_labels.append(encode_labels)
         gather_ious.append(encode_ious)
-    return gather_truth, gather_labels, gather_ious
+    return gather_locations, gather_labels, gather_ious
 
 
+def layers_loss(prediction_gathers, encoding_gathers, pos_th=0.5, neg_ratio=3):
+    gather_pred_locations, gather_pred_scores = prediction_gathers
+    gather_truth_locations, gather_truth_labels, gather_truth_ious = encoding_gathers
 
+    gather_pos_loss, gather_neg_loss, gather_reg_loss = [], [], []
+    for idx in range(len(default_params.feat_layers)):
+        pos_loss, neg_loss, reg_loss = _layer_loss(
+            locations=gather_pred_locations[idx],
+            scores=gather_pred_scores[idx],
+            encode_locations=gather_truth_locations[idx],
+            encode_labels=gather_truth_labels[idx],
+            encode_ious=gather_truth_ious[idx],
+            pos_th=pos_th,
+            neg_ratio=neg_ratio
+        )
+        gather_pos_loss.append(pos_loss)
+        gather_neg_loss.append(neg_loss)
+        gather_reg_loss.append(reg_loss)
+    return gather_pos_loss, gather_neg_loss, gather_reg_loss
 
-# if __name__ == '__main__':
-#     inputs = tf.placeholder(shape=[None, 300, 300, 3], dtype=tf.float32, name='inputs')
-#     with arg_scope(ssd_arg_scope()):
-#         net, end_points = ssd_vgg16(inputs)
-#
-#     layers_locations, layers_scores = layers_predictions(end_points)
-#     print(layers_locations)
-# layers_anchors_y, layers_anchors_x, layers_anchors_h, layers_anchors_w = layers_anchors(end_points)
+if __name__ == '__main__':
+    dataset = get_dataset(dir=TRAIN_DIR, batch_size=1, num_epochs=1)
+    name, image, labels, bboxes = get_next_batch(dataset)
+
+    # sess = tf.Session()
+    # sess.run(tf.global_variables_initializer())
+    # name_v, image_v, labels_v, bboxes_v = sess.run([name, image, labels, bboxes])
+    # print(name_v)
+    # print(bboxes_v)
+
+    # inputs = tf.placeholder(shape=[None, 300, 300, 3], dtype=tf.float32, name='inputs')
+    with arg_scope(ssd_arg_scope()):
+        net, end_points, prediction_gathers = ssd_vgg16(image, scope='ssd_vgg16_300')
+    all_anchors = layers_anchors(end_points)
+    encoding_gathers = layers_encoding(all_anchors, labels, bboxes)
+    gather_pos_loss, gather_neg_loss, gather_reg_loss = layers_loss(prediction_gathers, encoding_gathers)
+
