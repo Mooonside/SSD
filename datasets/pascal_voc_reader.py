@@ -12,8 +12,8 @@ from functools import partial as set_parameter
 FLAGS = None
 
 # Constants used for dealing with the files, matches convert_to_records.
-TRAIN_DIR = '/home/yifeng/DataSets/VOCdevkit/VOC2012/tf_detects/tf_records/train'
-VALIDATION_DIR = '/home/yifeng/DataSets/VOCdevkit/VOC2012/tf_detects/tf_records/val'
+TRAIN_DIR = '/mnt/disk/chenyifeng/VOC2012/tf_detects/tf_records/train'
+VALIDATION_DIR = '/mnt/disk/chenyifeng/VOC2012/tf_detects/tf_records/val'
 TRAIN_NUM = 5717
 VALID_NUM = 5823
 

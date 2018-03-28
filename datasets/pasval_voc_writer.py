@@ -154,5 +154,5 @@ def convert_train():
 
 
 if __name__ == '__main__':
-    convert_val()
-    # convert_train()
+    # convert_val()
+    convert_train()
