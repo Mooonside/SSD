@@ -3,10 +3,10 @@ from __future__ import division
 from __future__ import print_function
 
 import os.path
+from functools import partial as set_parameter
 
 import tensorflow as tf
 from tensorflow.python.ops import image_ops
-from functools import partial as set_parameter
 
 # Basic model parameters as external flags.
 FLAGS = None
@@ -16,6 +16,10 @@ TRAIN_DIR = '/mnt/disk/chenyifeng/VOC2012/tf_detects/tf_records/train'
 VALIDATION_DIR = '/mnt/disk/chenyifeng/VOC2012/tf_detects/tf_records/val'
 TRAIN_NUM = 5717
 VALID_NUM = 5823
+
+_R_MEAN = 123.
+_G_MEAN = 117.
+_B_MEAN = 104.
 
 
 def decode(serialized_example):
@@ -65,7 +69,8 @@ def augment(name, image, labels, bboxes):
 
 def normalize(name, image, labels, bboxes):
     # Convert from [0, 255] -> [-0.5, 0.5] floats.
-    image = tf.cast(image, tf.float32) * (1. / 255) - 0.5
+    image = tf.cast(image, tf.float32)
+    image = image - tf.constant([_R_MEAN, _G_MEAN, _B_MEAN])
     return name, image, labels, bboxes
 
 

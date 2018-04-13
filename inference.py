@@ -2,13 +2,15 @@ import os
 
 from datasets.pascal_voc_reader import get_dataset, get_next_batch, TRAIN_DIR
 from datasets.pascal_voc_utils import pascal_voc_classes
-from ssd import ssd_arg_scope, ssd_vgg16, default_params, layers_anchors, layers_loss, layers_encoding, DEBUG_COLLECTIONS
+from ssd import *
 from tf_ops.benchmarks import mAP, mIOU
 from tf_ops.visualize import paint, compare
 from tf_ops.wrap_ops import *
 from tf_utils import partial_restore, add_gradient_summary, \
     add_var_summary, add_activation_summary, parse_device_name, add_iou_summary
 
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 arg_scope = tf.contrib.framework.arg_scope
 
 LOSS_COLLECTIONS = tf.GraphKeys.LOSSES
@@ -44,13 +46,13 @@ tf.app.flags.DEFINE_string('bias_reg_func', None, 'use which func to regularize 
 tf.app.flags.DEFINE_string('summaries_dir', '/home/yifeng/TF_Logs/SSD/vgg16_300/sgpu',
                            'where to store summary log')
 
-tf.app.flags.DEFINE_string('pretrained_ckpts', '/home/yifeng/Models/pretrain/SSD_300x300/VGG_VOC0712_SSD_300x300_ft_iter_120000.ckpt',
+tf.app.flags.DEFINE_string('pretrained_ckpts', '/home/yifeng/Models/ckpts/ssd_vgg16_300/SSD_VGG300_120000.ckpt',
                            'where to load pretrained model')
 
-tf.app.flags.DEFINE_string('last_ckpt', '/home/yifeng/TF_Models/atrain/SSD/vgg16_300/sgpu',
+tf.app.flags.DEFINE_string('last_ckpt', '/home/yifeng/Models/atrain/SSD/',
                            'where to load last saved model')
 
-tf.app.flags.DEFINE_string('next_ckpt', '/home/yifeng/TF_Models/atrain/SSD/vgg16_300/sgpu',
+tf.app.flags.DEFINE_string('next_ckpt', '/home/yifeng/Models/atrain/SSD/',
                            'where to store current model')
 
 tf.app.flags.DEFINE_integer('save_per_step', 1000, 'save model per xxx steps')
@@ -93,20 +95,10 @@ with arg_scope([get_variable], device=store_device):
         with arg_scope(ssd_arg_scope(weight_init=None, weight_reg=weight_reg,
                   bias_init=tf.zeros_initializer, bias_reg=bias_reg, is_training=True)):
             net, endpoints, prediction_gathers = ssd_vgg16(image_batch, scope='ssd_vgg16_300')
-
-        all_anchors = layers_anchors(endpoints)
-        encoding_gathers = layers_encoding(all_anchors, labels_batch, bboxes_batch)
-        gather_locations, gather_labels, gather_ious = encoding_gathers
-        gather_pos_loss, gather_neg_loss, gather_box_loss = layers_loss(prediction_gathers, encoding_gathers)
-        # to do : ? check other strategies!
-        pos_loss = tf.add_n(gather_pos_loss)
-        neg_loss = tf.add_n(gather_neg_loss)
-        box_loss = tf.add_n(gather_box_loss)
-
-        reg_loss = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
-        reg_loss = tf.add_n(reg_loss)
-
-        total_loss = pos_loss + neg_loss + box_loss + reg_loss
+        gather_locations, gather_scores = prediction_gathers
+        gather_anchors = layers_anchors(endpoints)
+        gather_decode_bboxes = layers_decoding(gather_locations, gather_anchors)
+        scores, bboxes = layers_select_nms(gather_scores, gather_decode_bboxes, select_th=0.5)
 
         # # set up optimizer
         # decay_learning_rate = tf.train.exponential_decay(FLAGS.weight_learning_rate, global_step,
@@ -134,11 +126,11 @@ with arg_scope([get_variable], device=store_device):
     # add summaries
     with tf.name_scope('summary_input_output'):
         tf.summary.image('image_batch', image_batch, max_outputs=1)
-        tf.summary.scalar('pos_loss', pos_loss)
-        tf.summary.scalar('neg_loss', neg_loss)
-        tf.summary.scalar('box_loss', box_loss)
-        tf.summary.scalar('reg_loss', reg_loss)
-        tf.summary.scalar('total_loss', total_loss)
+        # tf.summary.scalar('pos_loss', pos_loss)
+        # tf.summary.scalar('neg_loss', neg_loss)
+        # tf.summary.scalar('box_loss', box_loss)
+        # tf.summary.scalar('reg_loss', reg_loss)
+        # tf.summary.scalar('total_loss', total_loss)
         # tf.summary.scalar('learning_rate', decay_learning_rate)
 
 
@@ -174,43 +166,36 @@ if FLAGS.last_ckpt is not None:
         print('Recovering From {}'.format(ckpt))
     else:
         print('No previous Model Found in {}'.format(ckpt))
-        if FLAGS.pretrained_ckpts is not None:
-            # pre-train priority higher
-            partial_restore_op = partial_restore(sess, tf.global_variables(), FLAGS.pretrained_ckpts)
-            sess.run(partial_restore_op)
-            print('Recovering From Pretrained Model {}'.format(FLAGS.pretrained_ckpts))
 
 
 
-try:
-    # start training
-    local_step = 0
-    sess.run(tf.local_variables_initializer())
-    DEBUG_VAR = tf.get_collection(DEBUG_COLLECTIONS)
-    while True:  # train until OutOfRangeError
-        # pos_loss_v, neg_loss_v, box_loss_v, reg_loss_v, total_loss_v, step, summary, _ = \
-        #     sess.run([pos_loss, neg_loss, box_loss, reg_loss, total_loss, global_step, merge_summary, train_op])
-        # train_writer.add_summary(summary, step)
 
-        gather_ious_v, pos_loss_v, neg_loss_v, box_loss_v, DEBUG_VAR_v = sess.run([gather_ious, gather_pos_loss, gather_neg_loss, gather_box_loss, DEBUG_VAR])
-        for i in gather_ious_v:
-            print(np.max(i), np.min(i))
-        print(pos_loss_v)
-        print(neg_loss_v)
-        print(box_loss_v)
-
-        for i in DEBUG_VAR_v:
-            print(np.sum(i))
-        local_step += 1
-
-        # save model per xxx steps
-        # if local_step % FLAGS.save_per_step == 0 and local_step > 0:
-        #     save_path = saver.save(sess, os.path.join(FLAGS.next_ckpt,
-        #                                               '{:.3f}_{}'.format(total_loss, step)))
-        #     print("Model saved in path: %s" % save_path)
-        print('==============================================================================================')
-        # print("Step {} : Total Loss {:.3f}  Pos Loss {:.3f}  Neg loss {:.3f} Box Loss {:.3f} REG Loss {:.3f}"
-        #       .format(step, total_loss_v, pos_loss_v, neg_loss_v, box_loss_v, reg_loss_v))
-
-except tf.errors.OutOfRangeError:
-    print('Done training')
+# if FLAGS.pretrained_ckpts is not None:
+#     # pre-train priority higher
+#     partial_restore_op = partial_restore(sess, tf.global_variables(), FLAGS.pretrained_ckpts)
+#     sess.run(partial_restore_op)
+#     print('Recovering From Pretrained Model {}'.format(FLAGS.pretrained_ckpts))
+#
+# local_step = 0
+# sess.run(tf.local_variables_initializer())
+# DEBUG_VAR = tf.get_collection(DEBUG_COLLECTIONS)
+# while True:  # train until OutOfRangeError
+#     # pos_loss_v, neg_loss_v, box_loss_v, reg_loss_v, total_loss_v, step, summary, _ = \
+#     #     sess.run([pos_loss, neg_loss, box_loss, reg_loss, total_loss, global_step, merge_summary, train_op])
+#     # train_writer.add_summary(summary, step)
+#
+#     name_v, gt_labels_v, scores_v, bboxes_v = sess.run([name_batch, labels_batch, scores, bboxes])
+#     print(name_v)
+#     print([pascal_voc_classes[int(i)] for i in gt_labels_v[0] if i is not None] )
+#     for i, s in enumerate(scores_v):
+#         if len(s) != 0:
+#             print(pascal_voc_classes[i], s[:min(10,len(s))]),
+#
+#     # #save model per xxx steps
+#     # if local_step % FLAGS.save_per_step == 0 and local_step > 0:
+#     #     save_path = saver.save(sess, os.path.join(FLAGS.next_ckpt,
+#     #                                               '{:.3f}_{}'.format(total_loss, step)))
+#     #     print("Model saved in path: %s" % save_path)
+#     print('==============================================================================================')
+#     # print("Step {} : Total Loss {:.3f}  Pos Loss {:.3f}  Neg loss {:.3f} Box Loss {:.3f} REG Loss {:.3f}"
+#     #       .format(step, total_loss_v, pos_loss_v, neg_loss_v, box_loss_v, reg_loss_v))
