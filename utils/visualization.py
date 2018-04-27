@@ -1,8 +1,9 @@
 import matplotlib.pyplot as plt
-from numpy import random
+import numpy as np
 
 
-def plt_bboxes(img, scores, bboxes, figsize=(10, 10), palette=None, linewidth=1.5, ignore_labels=[0]):
+
+def plt_bboxes(img, scores, bboxes, figsize=(10, 10), name_map=None, palette=None, linewidth=1.5, ignore_labels=[0]):
     """Visualize bounding boxes. Largely inspired by SSD-MXNET!
     """
     fig = plt.figure(figsize=figsize)
@@ -16,13 +17,13 @@ def plt_bboxes(img, scores, bboxes, figsize=(10, 10), palette=None, linewidth=1.
             continue
         else:
             try:
-                cls_score = scores[cls_id][0]
-                cls_bboxes = bboxes[cls_id][0]
+                cls_score = np.reshape(scores[cls_id], [-1])
+                cls_bboxes = np.reshape(bboxes[cls_id], [-1, 4])
             except:
                 continue
 
             if palette is None:
-                cls_color = (random.random(), random.random(), random.random())
+                cls_color = (np.random.random(), np.random.random(), np.random.random())
             else:
                 cls_color = tuple(palette[cls_id, :] / 255.0)
 
@@ -31,14 +32,17 @@ def plt_bboxes(img, scores, bboxes, figsize=(10, 10), palette=None, linewidth=1.
                 xmin = int(cls_bboxes[bbox_idx][1] * width)
                 ymax = int(cls_bboxes[bbox_idx][2] * height)
                 xmax = int(cls_bboxes[bbox_idx][3] * width)
-                #                 print("Class:{}, Score:{:.3f}, Bboxes:{}" .format(cls_id, bbox_score, cls_bboxes[bbox_idx]))
+                # print("Class:{}, Score:{:.3f}, Bboxes:{}" .format(cls_id, bbox_score, cls_bboxes[bbox_idx]))
 
                 rect = plt.Rectangle((xmin, ymin), xmax - xmin,
                                      ymax - ymin, fill=False,
                                      edgecolor=cls_color,
                                      linewidth=linewidth)
                 plt.gca().add_patch(rect)
-                class_name = str(cls_id)
+                if name_map is None:
+                    class_name = str(cls_id)
+                else:
+                    class_name = name_map[cls_id]
                 plt.gca().text(xmin, ymin - 2,
                                '{:s} | {:.3f}'.format(class_name, bbox_score),
                                bbox=dict(facecolor=cls_color, alpha=0.5),

@@ -48,12 +48,13 @@ def decode(serialized_example):
 def extract(features):
     name = features['image/name']
     image = features['image/encoded']
+    # read data in the format xmins, ymins, xmaxs, ymaxes as writer writes
     xmins = tf.sparse_tensor_to_dense(features['image/object/bbox/xmin'])
     ymins = tf.sparse_tensor_to_dense(features['image/object/bbox/ymin'])
     xmaxs = tf.sparse_tensor_to_dense(features['image/object/bbox/xmax'])
     ymaxs = tf.sparse_tensor_to_dense(features['image/object/bbox/ymax'])
     labels = tf.sparse_tensor_to_dense(features['image/object/bbox/label'])
-    # read data in the format xmins, ymins, xmaxs, ymaxes !
+    # stack use standard order
     bboxes = tf.transpose(tf.stack([ymins, xmins, ymaxs, xmaxs]))
 
     return name, image, labels, bboxes

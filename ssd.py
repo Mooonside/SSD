@@ -1,13 +1,22 @@
+import matplotlib.image as mpimg
 import numpy as np
 import tensorflow as tf
 
 from backbones.vgg_16 import vgg_conv_block
-from datasets.pascal_voc_reader import get_dataset, get_next_batch, TRAIN_DIR
-from tf_ops.wrap_ops import max_pool2d, conv2d, batch_norm2d, tensor_shape, drop_out,\
+from tf_ops.wrap_ops import max_pool2d, conv2d, batch_norm2d, tensor_shape, drop_out, \
     softmax_with_logits, smooth_l1, l2_norm_1D, LOSS_COLLECTIONS
 
 arg_scope = tf.contrib.framework.arg_scope
-DEBUG_COLLECTIONS = 'debug_collections'
+
+DEBUG_SCOPE = 'debug'
+
+
+class DEBUG:
+    def __init__(self):
+        pass
+
+
+DEBUG_VARS = DEBUG()
 
 
 class SSDParameters(object):
@@ -28,7 +37,7 @@ class SSDParameters(object):
                 [1, 2, .5]
             ]
         self.anchor_prior_scaling = [0.1, 0.1, 0.2, 0.2]
-        self.f2b_l2_norm = [True, False, False, False, False, False, False]
+        self.f2b_l2_norm = [True, False, False, False, False, False]
 
 
 default_params = SSDParameters()
@@ -149,8 +158,8 @@ def _layer_anchors(feature_shape, feature_step, scale_c, scale_n, ratios):
     # support broadcasting in encoding part
     y = np.expand_dims(y, axis=-1)
     x = np.expand_dims(x, axis=-1)
-    # relative position in feature map is the aligned relative position in whole image
-    y = (y + 0.5) * feature_step  / default_params.img_shape[0]
+    # may have (kernel - 1) / 2 pixels misalignment
+    y = (y + 0.5) * feature_step / default_params.img_shape[0]
     x = (x + 0.5) * feature_step / default_params.img_shape[1]
 
     h = []
@@ -259,10 +268,10 @@ def _layer_encoding(layer_anchors, labels, bboxes, background_label=0):
     encode_w = encode_xmax - encode_xmin
     # Do Bbox regression here
     # [h , w, c]  = ([h , w, c] - [h , w, 1]) / [c]
-    encode_cy = (encode_cy - anchors_cy) / anchors_h
-    encode_cx = (encode_cx - anchors_cx) / anchors_w
-    encode_h = tf.log(encode_h / anchors_h)
-    encode_w = tf.log(encode_w / anchors_w)
+    encode_cy = (encode_cy - anchors_cy) / anchors_h / default_params.anchor_prior_scaling[0]
+    encode_cx = (encode_cx - anchors_cx) / anchors_w / default_params.anchor_prior_scaling[1]
+    encode_h = tf.log(encode_h / anchors_h) / default_params.anchor_prior_scaling[2]
+    encode_w = tf.log(encode_w / anchors_w) / default_params.anchor_prior_scaling[3]
     # use SSD official orders instead !!!
     encode_locations = tf.stack([encode_cx, encode_cy, encode_w, encode_h], axis=-1)
     return encode_locations, encode_labels, encode_ious
@@ -302,9 +311,12 @@ def _layer_decode(locations, layer_anchors, clip=True):
     return bboxes
 
 
-def _layer_loss(locations, scores, encode_locations, encode_labels, encode_ious, pos_th, neg_ratio):
+def _layer_loss(locations, scores, encode_locations, encode_labels, encode_ious, pos_th, neg_th, neg_ratio,
+                background_label=0):
     """
-    Calculate loss for one layer
+    Calculate loss for one layer,
+    encode_labels corresponds to the GT box with highest iou, but this iou can be less than neg_th!
+    so need to process and create new labels !
     :param locations: predicted locations [1, H, W, K, 4 ]
     :param scores: predicted scores [1, H, W, K, 21]
     :param encode_locations: [H, W, K, 4]
@@ -314,21 +326,39 @@ def _layer_loss(locations, scores, encode_locations, encode_labels, encode_ious,
     """
     positive_mask = encode_ious > pos_th
     positive_num = tf.reduce_sum(tf.cast(positive_mask, tf.int32))
-    # if no positive , ensure still some negatives, e.g. at least four bboxes along H side
-    negative_num = tf.maximum(neg_ratio * positive_num, tf.shape(encode_locations)[0] * 4)
-    # ensure it is less than the number of all available bboxes
-    negative_num = tf.minimum(negative_num, tf.reduce_prod(encode_ious.shape))
-    # Hard Negative Mining
-    neg_values, _ = tf.nn.top_k(tf.reshape(-1.0 * encode_ious, [-1]), k=negative_num)
-    # in case that -neg_value[-1] is larger than pos_th
+
+    # need to redefine the labels, those assgined to some class with iou < neg_th, should be assgined to background
     negative_mask = tf.logical_and(
-        encode_ious < -neg_values[-1],
+        encode_ious < neg_th,
         tf.logical_not(positive_mask)
+    )
+    negative_labels = tf.where(negative_mask,
+                               background_label * tf.cast(negative_mask, tf.int32),
+                               encode_labels)
+
+    # calculate background scores
+    neg_scores = tf.nn.softmax(scores, axis=-1)[:, :, :, background_label]
+    neg_scores = tf.where(negative_mask,
+                          neg_scores,
+                          # set positive ones's negative score to be 1, so that it won't be count in top_k
+                          1.0 - tf.cast(negative_mask, tf.float32)
+                          )
+    # solve # negative, add one so that neg_values has more than one value
+    max_negative_num = 1 + tf.reduce_sum(tf.cast(negative_mask, tf.int32))
+    negative_num = tf.maximum(neg_ratio * positive_num, tf.shape(encode_locations)[0] * 4)
+    negative_num = tf.minimum(negative_num, max_negative_num)
+
+    # Hard Negative Mining :
+    # find those with lower background scores, but are indeed background!
+    neg_values, _ = tf.nn.top_k(tf.reshape(-1.0 * neg_scores, [-1]), k=negative_num)
+    negative_mask = tf.logical_and(
+        negative_mask,
+        neg_scores < -neg_values[-1]
     )
 
     positive_mask = tf.cast(positive_mask, tf.float32)
     negative_mask = tf.cast(negative_mask, tf.float32)
-    tf.add_to_collection(DEBUG_COLLECTIONS, -neg_values[-1])
+
     with tf.name_scope('cross_entropy_loss'):
         with tf.name_scope('positive'):
             pos_loss = softmax_with_logits(predictions=scores,
@@ -338,24 +368,24 @@ def _layer_loss(locations, scores, encode_locations, encode_labels, encode_ious,
                                            loss_collections=LOSS_COLLECTIONS)
         with tf.name_scope('negative'):
             neg_loss = softmax_with_logits(predictions=scores,
-                                           labels=encode_labels,
+                                           labels=negative_labels,
                                            ignore_labels=[],
                                            weights=tf.reshape(negative_mask, [-1]),
                                            loss_collections=LOSS_COLLECTIONS
                                            )
 
     with tf.name_scope('bbox_regression_loss'):
-        reg_loss = smooth_l1(locations - encode_locations)
-        reg_loss = tf.reduce_sum(reg_loss, axis=-1)
+        bbox_loss = smooth_l1(locations - encode_locations)
+        bbox_loss = tf.reduce_sum(bbox_loss, axis=-1)
 
         # [H*W*K]
-        reg_loss = tf.reduce_mean(
-            reg_loss * positive_mask,
-            name='regression_loss'
+        bbox_loss = tf.reduce_mean(
+            bbox_loss * positive_mask,
+            name='bbox_regression_loss'
         )
-        tf.add_to_collection(LOSS_COLLECTIONS, reg_loss)
+        tf.add_to_collection(LOSS_COLLECTIONS, bbox_loss)
 
-    return pos_loss, neg_loss, reg_loss
+    return pos_loss, neg_loss, bbox_loss
 
 
 def layers_predictions(end_points):
@@ -421,25 +451,26 @@ def layers_decoding(gather_locations, gather_anchors, clip=True):
     return gather_decode_bboxes
 
 
-def layers_loss(prediction_gathers, encoding_gathers, pos_th=0.5, neg_ratio=3):
+def layers_loss(prediction_gathers, encoding_gathers, pos_th=0.5, neg_th=0.3, neg_ratio=3):
     gather_pred_locations, gather_pred_scores = prediction_gathers
     gather_truth_locations, gather_truth_labels, gather_truth_ious = encoding_gathers
 
-    gather_pos_loss, gather_neg_loss, gather_reg_loss = [], [], []
+    gather_pos_loss, gather_neg_loss, gather_bbox_loss = [], [], []
     for idx in range(len(default_params.feat_layers)):
-        pos_loss, neg_loss, reg_loss = _layer_loss(
+        pos_loss, neg_loss, bbox_loss = _layer_loss(
             locations=gather_pred_locations[idx],
             scores=gather_pred_scores[idx],
             encode_locations=gather_truth_locations[idx],
             encode_labels=gather_truth_labels[idx],
             encode_ious=gather_truth_ious[idx],
             pos_th=pos_th,
+            neg_th=neg_th,
             neg_ratio=neg_ratio
         )
         gather_pos_loss.append(pos_loss)
         gather_neg_loss.append(neg_loss)
-        gather_reg_loss.append(reg_loss)
-    return gather_pos_loss, gather_neg_loss, gather_reg_loss
+        gather_bbox_loss.append(bbox_loss)
+    return gather_pos_loss, gather_neg_loss, gather_bbox_loss
 
 
 def layers_select_nms(gather_pred_scores, gather_decode_bboxes, select_th=0.5, nms_th=0.45, nms_k=200, num_classes=21):
@@ -482,7 +513,6 @@ def layers_select_nms(gather_pred_scores, gather_decode_bboxes, select_th=0.5, n
         select_score = tf.gather(nms_score, select_idxes)
         select_boxes = tf.gather(nms_boxes, select_idxes)
 
-
         gather_scores[class_id] = select_score
         gather_bboxes[class_id] = select_boxes
 
@@ -490,28 +520,84 @@ def layers_select_nms(gather_pred_scores, gather_decode_bboxes, select_th=0.5, n
 
 
 if __name__ == '__main__':
-    dataset = get_dataset(dir=TRAIN_DIR, batch_size=1, num_epochs=1)
-    name, image, labels, bboxes = get_next_batch(dataset)
+    # dataset = get_dataset(dir=TRAIN_DIR, batch_size=1, num_epochs=1)
+    # name, image, labels, bboxes = get_next_batch(dataset)
 
-    # name_v, image_v, labels_v, bboxes_v = sess.run([name, image, labels, bboxes])
-    # print(name_v)
-    # print(bboxes_v)
+    # Test with one image
+    raw_image = tf.placeholder(tf.uint8, shape=(None, None, 3))
+    labels = tf.placeholder(tf.int32, shape=(None, None))
+    bboxes = tf.placeholder(tf.float32, shape=(None, None, 4))
 
-    # inputs = tf.placeholder(shape=[None, 300, 300, 3], dtype=tf.float32, name='inputs')
-    with arg_scope(ssd_arg_scope()):
-        net, end_points, prediction_gathers = ssd_vgg16(image, scope='ssd_vgg16_300')
-        gather_locations, gather_scores = prediction_gathers
+    out_shape = (300, 300)
+    image = tf.to_float(raw_image)
+    image = image - tf.constant([123., 117., 104.])
+    image = tf.image.resize_images(image, (300, 300), method=tf.image.ResizeMethod.BILINEAR, align_corners=False)
+    image = tf.expand_dims(image, axis=0)
+    with tf.device('/GPU:0'):
+        with arg_scope(ssd_arg_scope(is_training=False)):
+            net, end_points, prediction_gathers = ssd_vgg16(image, scope='ssd_vgg16_300')
+            gather_locations, gather_scores = prediction_gathers
 
-    gather_anchors = layers_anchors(end_points)
-    gather_decode_bboxes = layers_decoding(gather_locations, gather_anchors)
-    gather_scores, gather_bboxes = layers_select_nms(gather_scores, gather_decode_bboxes)
-    # # For training
-    # encoding_gathers = layers_encoding(all_anchors, labels, bboxes)
-    # gather_pos_loss, gather_neg_loss, gather_reg_loss = layers_loss(prediction_gathers, encoding_gathers)
-    #
-    sess = tf.Session()
+        # # For inference
+        # gather_anchors = layers_anchors(end_points)
+        # gather_decode_bboxes = layers_decoding(gather_locations, gather_anchors)
+        # gather_scores, gather_bboxes = layers_select_nms(gather_scores, gather_decode_bboxes)
+
+        # For training
+        gather_anchors = layers_anchors(end_points)
+        encoding_gathers = layers_encoding(gather_anchors, labels, bboxes)
+        gather_locations, gather_labels, gather_ious = encoding_gathers
+        gather_pos_loss, gather_neg_loss, gather_bbox_loss = layers_loss(prediction_gathers, encoding_gathers)
+        pos_loss = tf.reduce_sum(gather_pos_loss)
+        neg_loss = tf.reduce_sum(gather_neg_loss)
+        box_loss = tf.reduce_sum(gather_bbox_loss)
+
+        total_loss = pos_loss + neg_loss + box_loss
+
+        variables = tf.global_variables()
+        optimizer = tf.train.GradientDescentOptimizer(learning_rate=1)
+        grads_vars = optimizer.compute_gradients(total_loss, variables)
+        grads_vars = [(grad, var) for grad, var in grads_vars if grad is not None]
+
+    # load example 2007_000027.jpg
+    image_v = mpimg.imread('2007_000027.jpg')
+    bboxes_v = np.asarray(
+        [
+            [[101, 174, 351, 349]]
+        ]
+    ).reshape([1, -1, 4])
+
+    image_h, image_w, _ = image_v.shape
+    bboxes_v = bboxes_v / np.asarray([image_h, image_w, image_h, image_w])
+    labels_v = np.asarray(
+        [
+            [15]
+        ]
+    ).reshape([1, -1])
+    config = tf.ConfigProto(log_device_placement=False, allow_soft_placement=True)
+    sess = tf.Session(config=config)
     sess.run(tf.global_variables_initializer())
-    sess.run([gather_locations])
+    saver = tf.train.Saver()
+    saver.restore(sess, '/home/yifeng/TF_Models/ckpts/ssd_vgg16_300/SSD_VGG300_120000.ckpt')
+    # saver.restore(sess, '/mnt/disk/chenyifeng/TF_Models/ptrain/ssd_vgg16_300/SSD_VGG300_120000.ckpt')
+    # saver.save(sess, save_path='/mnt/disk/chenyifeng/TF_Models/ptrain/ssd_vgg16_300_17/SSD_VGG300_120000.ckpt')
 
-    # For Evaling
-    # print(labels_v)
+    # p_v, n_v, r_l = sess.run([gather_pos_loss, gather_neg_loss, gather_bbox_loss], feed_dict={
+    #     bboxes: bboxes_v,
+    #     labels: labels_v,
+    #     raw_image: image_v
+    # })
+    # print(p_v, n_v, r_l)
+    tl, xxx = sess.run([total_loss, grads_vars], feed_dict={
+        bboxes: bboxes_v,
+        labels: labels_v,
+        raw_image: image_v
+    })
+    print(tl)
+    # print(xxx)
+    for idx, value in enumerate(xxx):
+        print(grads_vars[idx][1].name, np.any(np.isnan(np.asarray(value[0]))))
+        if not np.any(np.isnan(np.asarray(value[0]))):
+            print(np.mean(value[0]))
+    print('=' * 8)
+    # print(p_v, n_v, r_l))
